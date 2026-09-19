@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SilverCare — пульт</title>
   <link rel="stylesheet" href="/static/pico.min.css">
+  <link rel="icon" href="/static/logo.png">
   <style>
     :root {
       --pico-primary: #2563eb; --pico-primary-hover: #1d4ed8; --pico-primary-background: #2563eb;
@@ -25,11 +26,14 @@
 <body>
 <main class="container">
   <header style="display:flex; justify-content:space-between; align-items:flex-start; gap:1rem;">
-    <hgroup>
-      <h1>SilverCare</h1>
-      <p>Пульт родственника</p>
-    </hgroup>
-    <button id="refresh" class="secondary outline">Обновить</button>
+    <div style="display:flex; align-items:center; gap:1rem;">
+      <img src="/static/logo.png" alt="SilverCare" width="56" height="56" style="border-radius:12px; flex:none;">
+      <hgroup style="margin:0;">
+        <h1>SilverCare</h1>
+        <p>Пульт родственника</p>
+      </hgroup>
+    </div>
+    <button type="button" id="refresh" class="secondary outline">Обновить</button>
   </header>
   <div id="view"></div>
   <p><small id="updated" class="muted"></small></p>
@@ -84,7 +88,7 @@ async function renderList() {
       <td>${meds}</td>
       <td>${t ? `${cnt.taken} / ${cnt.missed} / ${cnt.pending}` : '<span class="muted">—</span>'}</td>
       <td>${nextText(t)}</td>
-      <td><button class="secondary outline sm del-patient">Удалить</button></td>
+      <td><button type="button" class="secondary outline sm" data-action="del-patient">Удалить</button></td>
     </tr>`;
   }).join('');
 
@@ -117,7 +121,7 @@ async function renderPatient(id) {
   const medRows = meds.length
     ? meds.map(m => `<tr data-med="${m.id}">
         <td class="wide">${esc(m.name)}</td><td>${esc(m.dose)}</td><td>${esc(m.times)}</td>
-        <td><button class="secondary outline sm del-med">Убрать</button></td></tr>`).join('')
+        <td><button type="button" class="secondary outline sm" data-action="del-med">Убрать</button></td></tr>`).join('')
     : '<tr><td colspan="4" class="muted">Лекарств нет</td></tr>';
   const itemRows = today.items.length
     ? today.items.map(i => `<tr><td>${hhmm(i.scheduled_at)}</td><td class="wide">${esc(i.medication_name)}</td><td>${badge(i.status)}</td></tr>`).join('')
@@ -157,8 +161,8 @@ async function renderPatient(id) {
       </div>
     </div>
     <div role="group" style="width:auto">
-      <button id="demo-slot" class="contrast">Демо-слот +2 мин</button>
-      <button id="reset-today" class="secondary outline">Сбросить сегодня</button>
+      <button type="button" class="contrast" data-action="demo-slot">Демо-слот +2 мин</button>
+      <button type="button" class="secondary outline" data-action="reset-today">Сбросить сегодня</button>
     </div>
     <small class="err" id="card-err"></small>`;
 }
@@ -219,20 +223,23 @@ $('#view').addEventListener('submit', async ev => {
 });
 
 $('#view').addEventListener('click', async ev => {
-  const btn = ev.target.closest('button');
-  if (!btn || btn.type === 'submit') return;
-  if (btn.classList.contains('del-patient')) {
+  // Delegated: buttons are re-rendered on every load(), so listen on the container.
+  // NOTE: button.type is "submit" by default even outside a form, so dispatch on data-action.
+  const btn = ev.target.closest('button[data-action]');
+  if (!btn) return;
+  const act = btn.dataset.action;
+  if (act === 'del-patient') {
     const tr = btn.closest('tr'); const id = tr.dataset.id;
     const name = $('a', tr).textContent;
     if (!confirm(`Удалить пациента «${name}» вместе с лекарствами и историей?`)) return;
     await action(btn, '#list-err', () => api('DELETE', `/patients/${id}`));
-  } else if (btn.classList.contains('del-med')) {
+  } else if (act === 'del-med') {
     const mid = btn.closest('tr').dataset.med;
     if (!confirm('Убрать лекарство из активных?')) return;
     await action(btn, '#med-err', () => api('DELETE', `/medications/${mid}`));
-  } else if (btn.id === 'demo-slot') {
+  } else if (act === 'demo-slot') {
     await action(btn, '#card-err', () => api('POST', `/patients/${route().id}/demo-slot?minutes=2`));
-  } else if (btn.id === 'reset-today') {
+  } else if (act === 'reset-today') {
     if (!confirm('Удалить все слоты пациента за сегодня?')) return;
     await action(btn, '#card-err', () => api('DELETE', `/patients/${route().id}/today`));
   }

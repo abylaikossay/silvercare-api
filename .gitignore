@@ -3,3 +3,4 @@ response.md
 __pycache__/
 .venv/
 .idea/
+scripts/
