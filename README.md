@@ -27,7 +27,11 @@ curl http://127.0.0.1:8000/stats
 
 - `GET /health` — проверка API и БД.
 - `POST /seed` — демо-данные (идемпотентно): Айгуль (id=1), Серик (id=2).
-- `GET /patients/{id}/today` — слоты на сегодня + `next` (ближайший pending).
+- `POST /patients` `{name}` — создать пациента.
+- `POST /patients/{id}/medications` `{name, dose, times}` — добавить лекарство (`times` = "08:00,20:00").
+- `GET /patients/{id}/today` — все слоты на сегодня + `next` (ближайший pending).
+- `POST /patients/{id}/demo-slot?minutes=2` — демо-слот через N минут на первое активное лекарство.
+- `DELETE /patients/{id}/today` — удалить все слоты пациента за сегодня.
 - `POST /intakes/{id}/take` — отметить приём.
 - `GET /stats` — taken / missed по пациентам и итого.
 

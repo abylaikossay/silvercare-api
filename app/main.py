@@ -3,14 +3,17 @@ from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session, selectinload
 
 from .db import Base, engine, get_db
 from .models import Intake, Medication, Patient
-from .schemas import IntakeOut, PatientOut, PatientStats, StatsOut, TodayOut
+from .schemas import (
+    DeletedOut, IntakeOut, MedicationCreate, MedicationOut, PatientCreate, PatientOut, PatientShort,
+    PatientStats, StatsOut, TodayOut,
+)
 
 TZ = ZoneInfo("Asia/Almaty")
 MISSED_AFTER = timedelta(minutes=60)
@@ -59,6 +62,20 @@ def to_intake_out(i: Intake) -> IntakeOut:
     )
 
 
+def day_bounds(day) -> tuple[datetime, datetime]:
+    start = datetime.combine(day, datetime.min.time())
+    return start, start + timedelta(days=1)
+
+
+def get_patient_or_404(db: Session, patient_id: int) -> Patient:
+    patient = db.scalar(
+        select(Patient).options(selectinload(Patient.medications)).where(Patient.id == patient_id)
+    )
+    if patient is None:
+        raise HTTPException(status_code=404, detail="patient not found")
+    return patient
+
+
 def materialize_today(db: Session, patient: Patient, now: datetime) -> list[Intake]:
     """Create today's intake rows for every active medication (idempotent)."""
     today = now.date()
@@ -78,13 +95,19 @@ def materialize_today(db: Session, patient: Patient, now: datetime) -> list[Inta
                 db.add(Intake(medication_id=med.id, scheduled_at=scheduled, status="pending"))
     db.flush()
 
-    start = datetime.combine(today, datetime.min.time())
-    end = start + timedelta(days=1)
+    # All of today's intakes for the patient's active medications, including
+    # rows not derived from `times` (e.g. created via /demo-slot).
+    start, end = day_bounds(today)
     intakes = db.scalars(
         select(Intake)
         .join(Medication)
         .options(selectinload(Intake.medication))
-        .where(Medication.patient_id == patient.id, Intake.scheduled_at >= start, Intake.scheduled_at < end)
+        .where(
+            Medication.patient_id == patient.id,
+            Medication.active.is_(True),
+            Intake.scheduled_at >= start,
+            Intake.scheduled_at < end,
+        )
         .order_by(Intake.scheduled_at, Intake.id)
     ).all()
     for i in intakes:
@@ -149,15 +172,12 @@ def seed(db: Session = Depends(get_db)):
 
 @app.get("/patients/{patient_id}/today", response_model=TodayOut)
 def patient_today(patient_id: int, db: Session = Depends(get_db)):
-    patient = db.scalar(
-        select(Patient).options(selectinload(Patient.medications)).where(Patient.id == patient_id)
-    )
-    if patient is None:
-        raise HTTPException(status_code=404, detail="patient not found")
+    patient = get_patient_or_404(db, patient_id)
     now = now_local()
     intakes = materialize_today(db, patient, now)
     items = [to_intake_out(i) for i in intakes]
-    next_item: Optional[IntakeOut] = next((x for x in items if x.status == "pending"), None)
+    pending = [x for x in items if x.status == "pending"]
+    next_item: Optional[IntakeOut] = min(pending, key=lambda x: x.scheduled_at) if pending else None
     return TodayOut(patient_id=patient.id, patient_name=patient.name, now=now, items=items, next=next_item)
 
 
@@ -208,3 +228,63 @@ def stats(db: Session = Depends(get_db)):
     taken = sum(r.taken for r in rows)
     missed = sum(r.missed for r in rows)
     return StatsOut(patients=rows, total=total, taken=taken, missed=missed, missed_pct=pct(missed, total))
+
+
+# ---------- management / demo endpoints ----------
+
+@app.post("/patients", response_model=PatientShort, status_code=201)
+def create_patient(body: PatientCreate, db: Session = Depends(get_db)):
+    patient = Patient(name=body.name)
+    db.add(patient)
+    db.commit()
+    db.refresh(patient)
+    return patient
+
+
+@app.post("/patients/{patient_id}/medications", response_model=MedicationOut, status_code=201)
+def create_medication(patient_id: int, body: MedicationCreate, db: Session = Depends(get_db)):
+    get_patient_or_404(db, patient_id)
+    med = Medication(patient_id=patient_id, name=body.name, dose=body.dose, times=body.times, active=True)
+    db.add(med)
+    db.commit()
+    db.refresh(med)
+    return med
+
+
+@app.post("/patients/{patient_id}/demo-slot", response_model=IntakeOut, status_code=201)
+def create_demo_slot(
+    patient_id: int,
+    minutes: int = Query(2, ge=0, le=24 * 60),
+    db: Session = Depends(get_db),
+):
+    patient = get_patient_or_404(db, patient_id)
+    med = next((m for m in sorted(patient.medications, key=lambda m: m.id) if m.active), None)
+    if med is None:
+        raise HTTPException(status_code=400, detail="patient has no active medications")
+    scheduled = (now_local() + timedelta(minutes=minutes)).replace(second=0, microsecond=0)
+    intake = db.scalar(
+        select(Intake).where(Intake.medication_id == med.id, Intake.scheduled_at == scheduled)
+    )
+    if intake is None:
+        intake = Intake(medication_id=med.id, scheduled_at=scheduled, status="pending")
+        db.add(intake)
+        db.commit()
+    db.refresh(intake)
+    intake.medication = med
+    return to_intake_out(intake)
+
+
+@app.delete("/patients/{patient_id}/today", response_model=DeletedOut)
+def delete_today(patient_id: int, db: Session = Depends(get_db)):
+    patient = get_patient_or_404(db, patient_id)
+    start, end = day_bounds(now_local().date())
+    med_ids = [m.id for m in patient.medications]
+    if not med_ids:
+        return DeletedOut(deleted=0)
+    result = db.execute(
+        delete(Intake).where(
+            Intake.medication_id.in_(med_ids), Intake.scheduled_at >= start, Intake.scheduled_at < end
+        )
+    )
+    db.commit()
+    return DeletedOut(deleted=result.rowcount)
