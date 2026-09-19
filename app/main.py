@@ -1,10 +1,13 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session, selectinload
 
@@ -15,6 +18,7 @@ from .schemas import (
     PatientStats, StatsOut, TodayOut,
 )
 
+STATIC_DIR = Path(__file__).parent / "static"
 TZ = ZoneInfo("Asia/Almaty")
 MISSED_AFTER = timedelta(minutes=60)
 
@@ -38,6 +42,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/admin", include_in_schema=False)
+def admin_page():
+    return FileResponse(STATIC_DIR / "admin.html", media_type="text/html")
 
 
 # ---------- helpers ----------
@@ -132,15 +142,16 @@ SEED = [
         "id": 1,
         "name": "Айгуль",
         "medications": [
-            {"name": "Амлодипин", "dose": "1 таблетка", "times": "08:00,20:00"},
-            {"name": "Метформин", "dose": "1 таблетка", "times": "08:00,14:00,20:00"},
+            {"name": "Амлодипин 5 мг", "dose": "1 таблетка", "times": "08:00,20:00"},
+            {"name": "Кардиомагнил", "dose": "1 таблетка", "times": "20:00"},
         ],
     },
     {
         "id": 2,
         "name": "Серик",
         "medications": [
-            {"name": "Аспирин", "dose": "1 таблетка", "times": "09:00"},
+            {"name": "Метформин 850 мг", "dose": "1 таблетка", "times": "08:00,20:00"},
+            {"name": "Эналаприл", "dose": "1 таблетка", "times": "09:00"},
         ],
     },
 ]
@@ -168,6 +179,13 @@ def seed(db: Session = Depends(get_db)):
         select(Patient).options(selectinload(Patient.medications)).order_by(Patient.id)
     ).all()
     return patients
+
+
+@app.get("/patients", response_model=list[PatientOut])
+def list_patients(db: Session = Depends(get_db)):
+    return db.scalars(
+        select(Patient).options(selectinload(Patient.medications)).order_by(Patient.id)
+    ).all()
 
 
 @app.get("/patients/{patient_id}/today", response_model=TodayOut)

@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="ru" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SilverCare — пульт</title>
+  <link rel="stylesheet" href="/static/pico.min.css">
+  <style>
+    :root { --pico-primary: #2563eb; --pico-primary-hover: #1d4ed8; --pico-primary-background: #2563eb; }
+    .badge { color: #fff; border-radius: 999px; padding: 2px 8px; font-size: 0.85em; white-space: nowrap; }
+    .badge-taken { background: #16a34a; }
+    .badge-missed { background: #dc2626; }
+    .badge-pending { background: #6b7280; }
+    .stat-number { font-size: 2rem; font-weight: 600; margin: 0; }
+  </style>
+</head>
+<body>
+<main class="container">
+  <header style="display:flex; justify-content:space-between; align-items:flex-start; gap:1rem;">
+    <hgroup>
+      <h1>SilverCare</h1>
+      <p>Пульт родственника</p>
+    </hgroup>
+    <button id="refresh" class="secondary outline">Обновить</button>
+  </header>
+
+  <section>
+    <h2>Итого</h2>
+    <div class="grid" id="totals">
+      <article><p class="stat-number" id="t-taken">–</p><small>Принято</small></article>
+      <article><p class="stat-number" id="t-missed">–</p><small>Пропущено</small></article>
+      <article><p class="stat-number" id="t-pct">–</p><small>Пропуски, %</small></article>
+    </div>
+  </section>
+
+  <section>
+    <details>
+      <summary>Добавить пациента</summary>
+      <form id="add-patient">
+        <fieldset role="group">
+          <input name="name" placeholder="Имя" required>
+          <button type="submit">Добавить</button>
+        </fieldset>
+        <small class="err" style="color: var(--pico-del-color)"></small>
+      </form>
+    </details>
+  </section>
+
+  <section id="patients"></section>
+  <p><small id="updated"></small></p>
+</main>
+
+<script>
+const $ = (sel, root = document) => root.querySelector(sel);
+const STATUS_RU = { taken: 'принято', missed: 'пропущено', pending: 'ожидает' };
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const hhmm = iso => iso ? iso.slice(11, 16) : '';
+
+async function api(method, url, body) {
+  const res = await fetch(url, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let data = null;
+  try { data = await res.json(); } catch (_) {}
+  if (!res.ok) throw new Error(errorText(res.status, data));
+  return data;
+}
+
+function errorText(status, data) {
+  if (!data || !data.detail) return `Ошибка ${status}`;
+  if (typeof data.detail === 'string') return `${status}: ${data.detail}`;
+  if (Array.isArray(data.detail)) {
+    return `${status}: ` + data.detail.map(e => `${(e.loc || []).slice(-1)[0]}: ${e.msg}`).join('; ');
+  }
+  return `Ошибка ${status}`;
+}
+
+function badge(status) {
+  return `<span class="badge badge-${esc(status)}">${esc(STATUS_RU[status] || status)}</span>`;
+}
+
+function patientCard(p, today) {
+  const meds = p.medications.length
+    ? p.medications.map(m => `<tr><td>${esc(m.name)}</td><td>${esc(m.dose)}</td><td>${esc(m.times)}</td></tr>`).join('')
+    : `<tr><td colspan="3"><small>Лекарств нет</small></td></tr>`;
+  const items = today && today.items && today.items.length
+    ? today.items.map(i => `<tr><td>${hhmm(i.scheduled_at)}</td><td>${esc(i.medication_name)}</td><td>${badge(i.status)}</td></tr>`).join('')
+    : `<tr><td colspan="3"><small>${today ? 'Слотов на сегодня нет' : 'Не удалось загрузить'}</small></td></tr>`;
+  const next = today && today.next ? `Следующий: ${hhmm(today.next.scheduled_at)} — ${esc(today.next.medication_name)}` : 'Ожидающих слотов нет';
+
+  return `
+  <article data-id="${p.id}">
+    <header><strong>${esc(p.name)}</strong> <span style="color: var(--pico-muted-color)">id ${p.id}</span></header>
+    <h4>Лекарства</h4>
+    <table class="striped">
+      <thead><tr><th>Название</th><th>Доза</th><th>Время</th></tr></thead>
+      <tbody>${meds}</tbody>
+    </table>
+    <details>
+      <summary>Добавить лекарство</summary>
+      <form class="add-med">
+        <fieldset role="group">
+          <input name="name" placeholder="Название" required>
+          <input name="dose" placeholder="Доза, напр. 1 таблетка" required>
+          <input name="times" placeholder="08:00,20:00" required>
+          <button type="submit">Добавить</button>
+        </fieldset>
+        <small class="err" style="color: var(--pico-del-color)"></small>
+      </form>
+    </details>
+    <h4>Сегодня</h4>
+    <table class="striped">
+      <thead><tr><th>Время</th><th>Лекарство</th><th>Статус</th></tr></thead>
+      <tbody>${items}</tbody>
+    </table>
+    <p><small>${next}</small></p>
+    <footer>
+      <div class="grid">
+        <button class="contrast demo-slot">Демо-слот +2 мин</button>
+        <button class="secondary outline reset-today">Сбросить сегодня</button>
+      </div>
+      <small class="err" style="color: var(--pico-del-color)"></small>
+    </footer>
+  </article>`;
+}
+
+async function load() {
+  const btn = $('#refresh');
+  btn.setAttribute('aria-busy', 'true');
+  try {
+    const [stats, patients] = await Promise.all([api('GET', '/stats'), api('GET', '/patients')]);
+    $('#t-taken').textContent = stats.taken;
+    $('#t-missed').textContent = stats.missed;
+    $('#t-pct').textContent = stats.missed_pct;
+
+    const todays = await Promise.all(patients.map(p => api('GET', `/patients/${p.id}/today`).catch(() => null)));
+    $('#patients').innerHTML = patients.length
+      ? patients.map((p, i) => patientCard(p, todays[i])).join('')
+      : '<p>Пациентов пока нет.</p>';
+    $('#updated').textContent = 'Обновлено: ' + new Date().toLocaleTimeString('ru-RU');
+  } catch (e) {
+    $('#updated').textContent = 'Ошибка загрузки: ' + e.message;
+  } finally {
+    btn.removeAttribute('aria-busy');
+  }
+}
+
+async function run(el, fn) {
+  const err = el.closest('article, form')?.querySelector('.err') || $('#add-patient .err');
+  err.textContent = '';
+  el.setAttribute('aria-busy', 'true');
+  try {
+    await fn();
+    await load();
+  } catch (e) {
+    // element may have been re-rendered; find the error slot again by patient id
+    const id = el.closest('article')?.dataset.id;
+    const target = id ? $(`article[data-id="${id}"] footer .err`) : err;
+    if (target) target.textContent = e.message;
+  } finally {
+    el.removeAttribute('aria-busy');
+  }
+}
+
+$('#refresh').addEventListener('click', load);
+
+$('#add-patient').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const form = ev.target;
+  const err = $('.err', form);
+  err.textContent = '';
+  try {
+    await api('POST', '/patients', { name: form.name.value.trim() });
+    form.reset();
+    await load();
+  } catch (e) { err.textContent = e.message; }
+});
+
+$('#patients').addEventListener('submit', async ev => {
+  const form = ev.target;
+  if (!form.classList.contains('add-med')) return;
+  ev.preventDefault();
+  const id = form.closest('article').dataset.id;
+  const err = $('.err', form);
+  err.textContent = '';
+  try {
+    await api('POST', `/patients/${id}/medications`, {
+      name: form.name.value.trim(), dose: form.dose.value.trim(), times: form.times.value.trim(),
+    });
+    form.reset();
+    await load();
+  } catch (e) { err.textContent = e.message; }
+});
+
+$('#patients').addEventListener('click', async ev => {
+  const btn = ev.target.closest('button');
+  if (!btn) return;
+  const article = btn.closest('article');
+  if (!article) return;
+  const id = article.dataset.id;
+  if (btn.classList.contains('demo-slot')) {
+    await run(btn, () => api('POST', `/patients/${id}/demo-slot?minutes=2`));
+  } else if (btn.classList.contains('reset-today')) {
+    if (!confirm('Удалить все слоты пациента за сегодня?')) return;
+    await run(btn, () => api('DELETE', `/patients/${id}/today`));
+  }
+});
+
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>
