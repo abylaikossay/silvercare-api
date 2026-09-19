@@ -34,6 +34,8 @@ curl http://127.0.0.1:8000/stats
 - `GET /patients/{id}/today` — все слоты на сегодня + `next` (ближайший pending).
 - `POST /patients/{id}/demo-slot?minutes=2` — демо-слот через N минут на первое активное лекарство.
 - `DELETE /patients/{id}/today` — удалить все слоты пациента за сегодня.
+- `DELETE /patients/{id}` — удалить пациента с лекарствами и слотами.
+- `DELETE /medications/{id}` — деактивировать лекарство (`active=false`, строка остаётся).
 - `POST /intakes/{id}/take` — отметить приём.
 - `GET /stats` — taken / missed по пациентам и итого.
 

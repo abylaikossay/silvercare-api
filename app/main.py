@@ -306,3 +306,25 @@ def delete_today(patient_id: int, db: Session = Depends(get_db)):
     )
     db.commit()
     return DeletedOut(deleted=result.rowcount)
+
+
+@app.delete("/medications/{medication_id}")
+def deactivate_medication(medication_id: int, db: Session = Depends(get_db)):
+    med = db.get(Medication, medication_id)
+    if med is None:
+        raise HTTPException(status_code=404, detail="medication not found")
+    med.active = False
+    db.commit()
+    return {"id": med.id, "active": False}
+
+
+@app.delete("/patients/{patient_id}")
+def delete_patient(patient_id: int, db: Session = Depends(get_db)):
+    patient = get_patient_or_404(db, patient_id)
+    med_ids = [m.id for m in patient.medications]
+    if med_ids:
+        db.execute(delete(Intake).where(Intake.medication_id.in_(med_ids)))
+        db.execute(delete(Medication).where(Medication.id.in_(med_ids)))
+    db.delete(patient)
+    db.commit()
+    return {"deleted": patient_id}
