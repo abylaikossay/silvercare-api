@@ -188,6 +188,11 @@ def list_patients(db: Session = Depends(get_db)):
     ).all()
 
 
+@app.get("/patients/{patient_id}", response_model=PatientOut)
+def get_patient(patient_id: int, db: Session = Depends(get_db)):
+    return get_patient_or_404(db, patient_id)
+
+
 @app.get("/patients/{patient_id}/today", response_model=TodayOut)
 def patient_today(patient_id: int, db: Session = Depends(get_db)):
     patient = get_patient_or_404(db, patient_id)

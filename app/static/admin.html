@@ -21,6 +21,8 @@
     button.sm { padding: 0.2rem 0.6rem; font-size: 0.85em; margin: 0; width: auto; }
     .muted { color: var(--pico-muted-color); }
     .err { color: var(--pico-del-color); }
+    .missed-box { border-left: 6px solid #dc2626; }
+    .missed-box ul { margin-bottom: 0; }
   </style>
 </head>
 <body>
@@ -33,7 +35,10 @@
         <p>Пульт родственника</p>
       </hgroup>
     </div>
-    <button type="button" id="refresh" class="secondary outline">Обновить</button>
+    <div style="display:flex; align-items:center; gap:0.75rem; flex:none;">
+      <small id="busy" class="muted" hidden>Обновляется…</small>
+      <button type="button" id="refresh" class="secondary outline">Обновить</button>
+    </div>
   </header>
   <div id="view"></div>
   <p><small id="updated" class="muted"></small></p>
@@ -41,6 +46,7 @@
 
 <script>
 const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const STATUS_RU = { taken: 'принято', missed: 'пропущено', pending: 'ожидает' };
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const hhmm = iso => iso ? iso.slice(11, 16) : '';
@@ -67,17 +73,46 @@ function errorText(status, data) {
   return `Ошибка ${status}`;
 }
 
+// ---------- busy indicator ----------
+// While any request is in flight: clicked button gets aria-busy + disabled,
+// every other action button is disabled, header shows "Обновляется…".
+let busyBtn = null;
+function setBusy(on, btn) {
+  $('#busy').hidden = !on;
+  if (on) {
+    busyBtn = btn || null;
+    if (busyBtn) busyBtn.setAttribute('aria-busy', 'true');
+  } else if (busyBtn) {
+    busyBtn.removeAttribute('aria-busy');
+    busyBtn = null;
+  }
+  $$('#view button, #refresh').forEach(b => { b.disabled = on; });
+}
+
 // ---------- routing ----------
 function route() {
   const m = location.hash.match(/^#\/patient\/(\d+)$/);
   return m ? { name: 'patient', id: Number(m[1]) } : { name: 'list' };
 }
 
+// ---------- missed block ----------
+// entries: [{time, patient, med, iso}] → <article> with red left border, or '' if none.
+function missedBlock(entries) {
+  if (!entries.length) return '';
+  entries.sort((a, b) => a.iso.localeCompare(b.iso));
+  const lis = entries.map(e => `<li>${e.patient ? esc(e.patient) + ' — ' : ''}${esc(e.med)} ${hhmm(e.iso)}</li>`).join('');
+  return `<article class="missed-box"><strong>Пропущено сегодня</strong><ul>${lis}</ul></article>`;
+}
+const missedOf = (today, patientName) => (today ? today.items : [])
+  .filter(i => i.status === 'missed')
+  .map(i => ({ iso: i.scheduled_at, med: i.medication_name, patient: patientName }));
+
 // ---------- screen 1: patients list ----------
 async function renderList() {
   const [stats, patients] = await Promise.all([api('GET', '/stats'), api('GET', '/patients')]);
   const todays = await Promise.all(patients.map(p => api('GET', `/patients/${p.id}/today`).catch(() => null)));
 
+  const missed = patients.flatMap((p, i) => missedOf(todays[i], p.name));
   const rows = patients.map((p, i) => {
     const t = todays[i];
     const cnt = { taken: 0, missed: 0, pending: 0 };
@@ -94,6 +129,7 @@ async function renderList() {
 
   $('#view').innerHTML = `
     <p>Итого: Принято <strong>${stats.taken}</strong> · Пропущено <strong>${stats.missed}</strong> · Пропуски <strong>${stats.missed_pct} %</strong></p>
+    ${missedBlock(missed)}
     <table class="striped">
       <thead><tr><th class="wide">Имя</th><th>Лекарств</th><th>Сегодня: принято / пропущено / ожидает</th><th>Следующий приём</th><th></th></tr></thead>
       <tbody>${rows || '<tr><td colspan="5" class="muted">Пациентов пока нет</td></tr>'}</tbody>
@@ -113,9 +149,8 @@ async function renderList() {
 
 // ---------- screen 2: patient card ----------
 async function renderPatient(id) {
-  const [patients, today] = await Promise.all([api('GET', '/patients'), api('GET', `/patients/${id}/today`)]);
-  const p = patients.find(x => x.id === id);
-  if (!p) throw new Error(`Пациент ${id} не найден`);
+  // Only this patient's data: /patients/{id} + /patients/{id}/today.
+  const [p, today] = await Promise.all([api('GET', `/patients/${id}`), api('GET', `/patients/${id}/today`)]);
 
   const meds = p.medications.filter(m => m.active);
   const medRows = meds.length
@@ -153,6 +188,7 @@ async function renderPatient(id) {
       </div>
       <div>
         <h4>Сегодня</h4>
+        ${missedBlock(missedOf(today, null))}
         <table class="striped">
           <thead><tr><th>Время</th><th class="wide">Лекарство</th><th>Статус</th></tr></thead>
           <tbody>${itemRows}</tbody>
@@ -169,11 +205,12 @@ async function renderPatient(id) {
 
 // ---------- load / actions ----------
 let loading = false;
-async function load() {
+// Fetch and render the current screen. The old DOM stays until new data arrives
+// (renderers only touch innerHTML at the very end).
+async function load(btn) {
   if (loading) return;
   loading = true;
-  const btn = $('#refresh');
-  btn.setAttribute('aria-busy', 'true');
+  setBusy(true, btn || $('#refresh'));
   try {
     const r = route();
     if (r.name === 'patient') await renderPatient(r.id); else await renderList();
@@ -181,72 +218,79 @@ async function load() {
   } catch (e) {
     $('#view').innerHTML = `<p><a href="#/">← Пациенты</a></p><p class="err">Ошибка загрузки: ${esc(e.message)}</p>`;
   } finally {
-    btn.removeAttribute('aria-busy');
+    setBusy(false);
     loading = false;
   }
 }
 
+// Run an action (fn) with the clicked button busy, then reload the screen.
 async function action(btn, errSel, fn) {
+  if (loading) return;
   const err = $(errSel);
   if (err) err.textContent = '';
-  btn.setAttribute('aria-busy', 'true');
+  loading = true;
+  setBusy(true, btn);
+  let failed = null;
   try {
     await fn();
-    await load();
   } catch (e) {
-    const e2 = $(errSel);
-    if (e2) e2.textContent = e.message;
-    btn.removeAttribute('aria-busy');
+    failed = e;
+  } finally {
+    setBusy(false);
+    loading = false;
   }
+  if (failed) {
+    const e2 = $(errSel);
+    if (e2) e2.textContent = failed.message;
+    return;
+  }
+  await load(btn);
 }
 
-$('#refresh').addEventListener('click', load);
-window.addEventListener('hashchange', load);
+$('#refresh').addEventListener('click', () => load($('#refresh')));
+window.addEventListener('hashchange', () => load());
 
-$('#view').addEventListener('submit', async ev => {
+$('#view').addEventListener('submit', ev => {
   const form = ev.target;
   ev.preventDefault();
-  const err = $('.err', form);
-  err.textContent = '';
-  try {
-    if (form.id === 'add-patient') {
-      await api('POST', '/patients', { name: form.name.value.trim() });
-    } else if (form.id === 'add-med') {
-      const id = route().id;
-      await api('POST', `/patients/${id}/medications`, {
-        name: form.name.value.trim(), dose: form.dose.value.trim(), times: form.times.value.trim(),
-      });
-    } else return;
-    form.reset();
-    await load();
-  } catch (e) { err.textContent = e.message; }
+  const submitBtn = $('button[type="submit"]', form);
+  let call;
+  if (form.id === 'add-patient') {
+    call = () => api('POST', '/patients', { name: form.name.value.trim() });
+  } else if (form.id === 'add-med') {
+    call = () => api('POST', `/patients/${route().id}/medications`, {
+      name: form.name.value.trim(), dose: form.dose.value.trim(), times: form.times.value.trim(),
+    });
+  } else return;
+  const errSel = `#${form.id} .err`;
+  action(submitBtn, errSel, async () => { await call(); form.reset(); });
 });
 
-$('#view').addEventListener('click', async ev => {
+$('#view').addEventListener('click', ev => {
   // Delegated: buttons are re-rendered on every load(), so listen on the container.
   // NOTE: button.type is "submit" by default even outside a form, so dispatch on data-action.
   const btn = ev.target.closest('button[data-action]');
-  if (!btn) return;
+  if (!btn || btn.disabled) return;
   const act = btn.dataset.action;
   if (act === 'del-patient') {
     const tr = btn.closest('tr'); const id = tr.dataset.id;
     const name = $('a', tr).textContent;
     if (!confirm(`Удалить пациента «${name}» вместе с лекарствами и историей?`)) return;
-    await action(btn, '#list-err', () => api('DELETE', `/patients/${id}`));
+    action(btn, '#list-err', () => api('DELETE', `/patients/${id}`));
   } else if (act === 'del-med') {
     const mid = btn.closest('tr').dataset.med;
     if (!confirm('Убрать лекарство из активных?')) return;
-    await action(btn, '#med-err', () => api('DELETE', `/medications/${mid}`));
+    action(btn, '#med-err', () => api('DELETE', `/medications/${mid}`));
   } else if (act === 'demo-slot') {
-    await action(btn, '#card-err', () => api('POST', `/patients/${route().id}/demo-slot?minutes=2`));
+    action(btn, '#card-err', () => api('POST', `/patients/${route().id}/demo-slot?minutes=2`));
   } else if (act === 'reset-today') {
     if (!confirm('Удалить все слоты пациента за сегодня?')) return;
-    await action(btn, '#card-err', () => api('DELETE', `/patients/${route().id}/today`));
+    action(btn, '#card-err', () => api('DELETE', `/patients/${route().id}/today`));
   }
 });
 
 load();
-setInterval(load, 30000);
+setInterval(() => load(), 30000);
 </script>
 </body>
 </html>
