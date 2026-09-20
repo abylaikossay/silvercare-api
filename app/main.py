@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -9,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from .db import Base, engine, get_db
@@ -17,6 +19,10 @@ from .schemas import (
     DeletedOut, IntakeOut, MedicationCreate, MedicationOut, PatientCreate, PatientOut, PatientShort,
     PatientStats, StatsOut, TodayOut,
 )
+
+# uvicorn configures only its own loggers, so give ours a handler too
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("silvercare")
 
 STATIC_DIR = Path(__file__).parent / "static"
 TZ = ZoneInfo("Asia/Almaty")
@@ -31,6 +37,11 @@ def now_local() -> datetime:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
+    # create_all does not touch existing tables, so add the soft-delete flag by hand
+    with engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE patients ADD COLUMN IF NOT EXISTS archived boolean NOT NULL DEFAULT false"
+        ))
     yield
 
 
@@ -83,6 +94,33 @@ def get_patient_or_404(db: Session, patient_id: int) -> Patient:
     )
     if patient is None:
         raise HTTPException(status_code=404, detail="patient not found")
+    return patient
+
+
+def sync_patient_id_sequence(db: Session) -> None:
+    db.execute(text(
+        "SELECT setval(pg_get_serial_sequence('patients', 'id'), (SELECT MAX(id) FROM patients))"
+    ))
+
+
+def get_or_create_patient(db: Session, patient_id: int) -> Patient:
+    """Phones keep their patient_id forever, so an unknown id creates the patient."""
+    patient = db.scalar(
+        select(Patient).options(selectinload(Patient.medications)).where(Patient.id == patient_id)
+    )
+    if patient is not None:
+        return patient
+    patient = Patient(id=patient_id, name=f"Пациент {patient_id}", archived=False)
+    db.add(patient)
+    try:
+        db.commit()
+    except IntegrityError:  # created concurrently by another request
+        db.rollback()
+        return get_patient_or_404(db, patient_id)
+    sync_patient_id_sequence(db)
+    db.commit()
+    db.refresh(patient)
+    log.info("auto-created patient id=%s name=%r for unknown id from device", patient.id, patient.name)
     return patient
 
 
@@ -165,6 +203,7 @@ def seed(db: Session = Depends(get_db)):
             patient = Patient(id=p["id"], name=p["name"])
             db.add(patient)
             db.flush()
+        patient.archived = False  # re-seeding brings a demo patient back to the console
         for m in p["medications"]:
             exists = db.scalar(
                 select(Medication.id).where(Medication.patient_id == patient.id, Medication.name == m["name"])
@@ -173,10 +212,13 @@ def seed(db: Session = Depends(get_db)):
                 db.add(Medication(patient_id=patient.id, active=True, **m))
     db.commit()
     # keep the sequence in sync after explicit ids
-    db.execute(text("SELECT setval(pg_get_serial_sequence('patients', 'id'), (SELECT MAX(id) FROM patients))"))
+    sync_patient_id_sequence(db)
     db.commit()
     patients = db.scalars(
-        select(Patient).options(selectinload(Patient.medications)).order_by(Patient.id)
+        select(Patient)
+        .options(selectinload(Patient.medications))
+        .where(Patient.archived.is_(False))
+        .order_by(Patient.id)
     ).all()
     return patients
 
@@ -184,7 +226,10 @@ def seed(db: Session = Depends(get_db)):
 @app.get("/patients", response_model=list[PatientOut])
 def list_patients(db: Session = Depends(get_db)):
     return db.scalars(
-        select(Patient).options(selectinload(Patient.medications)).order_by(Patient.id)
+        select(Patient)
+        .options(selectinload(Patient.medications))
+        .where(Patient.archived.is_(False))
+        .order_by(Patient.id)
     ).all()
 
 
@@ -195,7 +240,7 @@ def get_patient(patient_id: int, db: Session = Depends(get_db)):
 
 @app.get("/patients/{patient_id}/today", response_model=TodayOut)
 def patient_today(patient_id: int, db: Session = Depends(get_db)):
-    patient = get_patient_or_404(db, patient_id)
+    patient = get_or_create_patient(db, patient_id)
     now = now_local()
     intakes = materialize_today(db, patient, now)
     items = [to_intake_out(i) for i in intakes]
@@ -222,7 +267,9 @@ def take_intake(intake_id: int, db: Session = Depends(get_db)):
 @app.get("/stats", response_model=StatsOut)
 def stats(db: Session = Depends(get_db)):
     now = now_local()
-    patients = db.scalars(select(Patient).order_by(Patient.id)).all()
+    patients = db.scalars(
+        select(Patient).where(Patient.archived.is_(False)).order_by(Patient.id)
+    ).all()
     intakes = db.scalars(
         select(Intake).options(selectinload(Intake.medication))
     ).all()
@@ -325,11 +372,9 @@ def deactivate_medication(medication_id: int, db: Session = Depends(get_db)):
 
 @app.delete("/patients/{patient_id}")
 def delete_patient(patient_id: int, db: Session = Depends(get_db)):
+    """Soft delete: the patient disappears from the console but their phone keeps working."""
     patient = get_patient_or_404(db, patient_id)
-    med_ids = [m.id for m in patient.medications]
-    if med_ids:
-        db.execute(delete(Intake).where(Intake.medication_id.in_(med_ids)))
-        db.execute(delete(Medication).where(Medication.id.in_(med_ids)))
-    db.delete(patient)
+    patient.archived = True
     db.commit()
-    return {"deleted": patient_id}
+    log.info("archived patient id=%s name=%r", patient.id, patient.name)
+    return {"deleted": patient_id, "archived": True}

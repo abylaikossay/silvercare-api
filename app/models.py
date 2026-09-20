@@ -12,6 +12,7 @@ class Patient(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(200))
+    archived: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
     medications: Mapped[list["Medication"]] = relationship(back_populates="patient")
 
